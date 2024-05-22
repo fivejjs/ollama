@@ -18,8 +18,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jmorganca/ollama/auth"
-	"github.com/jmorganca/ollama/version"
+	"github.com/ollama/ollama/auth"
+	"github.com/ollama/ollama/version"
 )
 
 var (
@@ -85,6 +85,11 @@ func IsNewReleaseAvailable(ctx context.Context) (bool, UpdateResponse) {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		slog.Warn(fmt.Sprintf("failed to read body response: %s", err))
+	}
+
+	if resp.StatusCode != 200 {
+		slog.Info(fmt.Sprintf("check update error %d - %.96s", resp.StatusCode, string(body)))
+		return false, updateResp
 	}
 	err = json.Unmarshal(body, &updateResp)
 	if err != nil {

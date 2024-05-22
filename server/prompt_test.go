@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/jmorganca/ollama/api"
+	"github.com/ollama/ollama/api"
 )
 
 func TestPrompt(t *testing.T) {
@@ -155,7 +155,7 @@ func TestChatPrompt(t *testing.T) {
 				{Role: "user", Content: "Hello", Images: []api.ImageData{[]byte("base64")}},
 			},
 			window: 1024,
-			want:   "You are a Wizard. Hello [img-0]",
+			want:   "You are a Wizard. [img-0] Hello",
 		},
 		{
 			name:     "images truncated",
@@ -165,7 +165,7 @@ func TestChatPrompt(t *testing.T) {
 				{Role: "user", Content: "Hello", Images: []api.ImageData{[]byte("img1"), []byte("img2")}},
 			},
 			window: 1024,
-			want:   "You are a Wizard. Hello [img-1]",
+			want:   "You are a Wizard. [img-0] [img-1] Hello",
 		},
 		{
 			name:     "empty list",
@@ -198,7 +198,7 @@ func TestChatPrompt(t *testing.T) {
 			}
 
 			if got != tc.want {
-				t.Errorf("got = %v, want %v", got, tc.want)
+				t.Errorf("got: %q, want: %q", got, tc.want)
 			}
 		})
 	}
