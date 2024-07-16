@@ -8,9 +8,10 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
-	"text/template"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/ollama/ollama/api"
 	"github.com/ollama/ollama/llm"
 )
@@ -47,7 +48,7 @@ func TestNamed(t *testing.T) {
 					t.Fatal(err)
 				}
 
-				tmpl, err := template.New(s).Parse(b.String())
+				tmpl, err := Parse(b.String())
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -57,6 +58,97 @@ func TestNamed(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestTemplate(t *testing.T) {
+	cases := make(map[string][]api.Message)
+	for _, mm := range [][]api.Message{
+		{
+			{Role: "user", Content: "Hello, how are you?"},
+		},
+		{
+			{Role: "user", Content: "Hello, how are you?"},
+			{Role: "assistant", Content: "I'm doing great. How can I help you today?"},
+			{Role: "user", Content: "I'd like to show off how chat templating works!"},
+		},
+		{
+			{Role: "system", Content: "You are a helpful assistant."},
+			{Role: "user", Content: "Hello, how are you?"},
+			{Role: "assistant", Content: "I'm doing great. How can I help you today?"},
+			{Role: "user", Content: "I'd like to show off how chat templating works!"},
+		},
+	} {
+		var roles []string
+		for _, m := range mm {
+			roles = append(roles, m.Role)
+		}
+
+		cases[strings.Join(roles, "-")] = mm
+	}
+
+	matches, err := filepath.Glob("*.gotmpl")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, match := range matches {
+		t.Run(match, func(t *testing.T) {
+			bts, err := os.ReadFile(match)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			tmpl, err := Parse(string(bts))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			for n, tt := range cases {
+				var actual bytes.Buffer
+				t.Run(n, func(t *testing.T) {
+					if err := tmpl.Execute(&actual, Values{Messages: tt}); err != nil {
+						t.Fatal(err)
+					}
+
+					expect, err := os.ReadFile(filepath.Join("testdata", match, n))
+					if err != nil {
+						t.Fatal(err)
+					}
+
+					bts := actual.Bytes()
+
+					if slices.Contains([]string{"chatqa.gotmpl", "llama2-chat.gotmpl", "mistral-instruct.gotmpl", "openchat.gotmpl", "vicuna.gotmpl"}, match) && bts[len(bts)-1] == ' ' {
+						t.Log("removing trailing space from output")
+						bts = bts[:len(bts)-1]
+					}
+
+					if diff := cmp.Diff(bts, expect); diff != "" {
+						t.Errorf("mismatch (-got +want):\n%s", diff)
+					}
+				})
+
+				t.Run("legacy", func(t *testing.T) {
+					t.Skip("legacy outputs are currently default outputs")
+					var legacy bytes.Buffer
+					if err := tmpl.Execute(&legacy, Values{Messages: tt, forceLegacy: true}); err != nil {
+						t.Fatal(err)
+					}
+
+					legacyBytes := legacy.Bytes()
+					if slices.Contains([]string{"chatqa.gotmpl", "openchat.gotmpl", "vicuna.gotmpl"}, match) && legacyBytes[len(legacyBytes)-1] == ' ' {
+						t.Log("removing trailing space from legacy output")
+						legacyBytes = legacyBytes[:len(legacyBytes)-1]
+					} else if slices.Contains([]string{"codellama-70b-instruct.gotmpl", "llama2-chat.gotmpl", "mistral-instruct.gotmpl"}, match) {
+						t.Skip("legacy outputs cannot be compared to messages outputs")
+					}
+
+					if diff := cmp.Diff(legacyBytes, actual.Bytes()); diff != "" {
+						t.Errorf("mismatch (-got +want):\n%s", diff)
+					}
+				})
+			}
+		})
 	}
 }
 
@@ -70,7 +162,24 @@ func TestParse(t *testing.T) {
 		{"{{ .System }} {{ .Prompt }} {{ .Response }}", []string{"prompt", "response", "system"}},
 		{"{{ with .Tools }}{{ . }}{{ end }} {{ .System }} {{ .Prompt }}", []string{"prompt", "response", "system", "tools"}},
 		{"{{ range .Messages }}{{ .Role }} {{ .Content }}{{ end }}", []string{"content", "messages", "role"}},
-		{"{{ range .Messages }}{{ if eq .Role \"system\" }}SYSTEM: {{ .Content }}{{ else if eq .Role \"user\" }}USER: {{ .Content }}{{ else if eq .Role \"assistant\" }}ASSISTANT: {{ .Content }}{{ end }}{{ end }}", []string{"content", "messages", "role"}},
+		{`{{- range .Messages }}
+{{- if eq .Role "system" }}SYSTEM:
+{{- else if eq .Role "user" }}USER:
+{{- else if eq .Role "assistant" }}ASSISTANT:
+{{- end }} {{ .Content }}
+{{- end }}`, []string{"content", "messages", "role"}},
+		{`{{- if .Messages }}
+{{- range .Messages }}<|im_start|>{{ .Role }}
+{{ .Content }}<|im_end|>
+{{ end }}<|im_start|>assistant
+{{ else -}}
+{{ if .System }}<|im_start|>system
+{{ .System }}<|im_end|>
+{{ end }}{{ if .Prompt }}<|im_start|>user
+{{ .Prompt }}<|im_end|>
+{{ end }}<|im_start|>assistant
+{{ .Response }}<|im_end|>
+{{- end -}}`, []string{"content", "messages", "prompt", "response", "role", "system"}},
 	}
 
 	for _, tt := range cases {
@@ -80,9 +189,8 @@ func TestParse(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			vars := tmpl.Vars()
-			if !slices.Equal(tt.vars, vars) {
-				t.Errorf("expected %v, got %v", tt.vars, vars)
+			if diff := cmp.Diff(tmpl.Vars(), tt.vars); diff != "" {
+				t.Errorf("mismatch (-got +want):\n%s", diff)
 			}
 		})
 	}
@@ -102,12 +210,17 @@ func TestExecuteWithMessages(t *testing.T) {
 		{
 			"mistral",
 			[]template{
-				{"no response", `[INST] {{ if .System }}{{ .System }}{{ "\n\n" }}{{ end }}{{ .Prompt }}[/INST] `},
-				{"response", `[INST] {{ if .System }}{{ .System }}{{ "\n\n" }}{{ end }}{{ .Prompt }}[/INST] {{ .Response }}`},
-				{"messages", `{{- range $index, $_ := .Messages }}
-{{- if eq .Role "user" }}[INST] {{ if and (eq (len (slice $.Messages $index)) 1) $.System }}{{ $.System }}{{ "\n\n" }}
-{{- end }}{{ .Content }}[/INST] {{ else if eq .Role "assistant" }}{{ .Content }}
-{{- end }}
+				{"no response", `[INST] {{ if .System }}{{ .System }}
+
+{{ end }}{{ .Prompt }}[/INST] `},
+				{"response", `[INST] {{ if .System }}{{ .System }}
+
+{{ end }}{{ .Prompt }}[/INST] {{ .Response }}`},
+				{"messages", `[INST] {{ if .System }}{{ .System }}
+
+{{ end }}
+{{- range .Messages }}
+{{- if eq .Role "user" }}{{ .Content }}[/INST] {{ else if eq .Role "assistant" }}{{ .Content }}[INST] {{ end }}
 {{- end }}`},
 			},
 			Values{
@@ -122,13 +235,17 @@ func TestExecuteWithMessages(t *testing.T) {
 		{
 			"mistral system",
 			[]template{
-				{"no response", `[INST] {{ if .System }}{{ .System }}{{ "\n\n" }}{{ end }}{{ .Prompt }}[/INST] `},
-				{"response", `[INST] {{ if .System }}{{ .System }}{{ "\n\n" }}{{ end }}{{ .Prompt }}[/INST] {{ .Response }}`},
-				{"messages", `
-{{- range $index, $_ := .Messages }}
-{{- if eq .Role "user" }}[INST] {{ if and (eq (len (slice $.Messages $index)) 1) $.System }}{{ $.System }}{{ "\n\n" }}
-{{- end }}{{ .Content }}[/INST] {{ else if eq .Role "assistant" }}{{ .Content }}
-{{- end }}
+				{"no response", `[INST] {{ if .System }}{{ .System }}
+
+{{ end }}{{ .Prompt }}[/INST] `},
+				{"response", `[INST] {{ if .System }}{{ .System }}
+
+{{ end }}{{ .Prompt }}[/INST] {{ .Response }}`},
+				{"messages", `[INST] {{ if .System }}{{ .System }}
+
+{{ end }}
+{{- range .Messages }}
+{{- if eq .Role "user" }}{{ .Content }}[/INST] {{ else if eq .Role "assistant" }}{{ .Content }}[INST] {{ end }}
 {{- end }}`},
 			},
 			Values{
@@ -139,9 +256,9 @@ func TestExecuteWithMessages(t *testing.T) {
 					{Role: "user", Content: "What is your name?"},
 				},
 			},
-			`[INST] Hello friend![/INST] Hello human![INST] You are a helpful assistant!
+			`[INST] You are a helpful assistant!
 
-What is your name?[/INST] `,
+Hello friend![/INST] Hello human![INST] What is your name?[/INST] `,
 		},
 		{
 			"chatml",
@@ -155,12 +272,9 @@ What is your name?[/INST] `,
 {{ .Response }}<|im_end|>
 `},
 				{"messages", `
-{{- range $index, $_ := .Messages }}
-{{- if and (eq .Role "user") (eq (len (slice $.Messages $index)) 1) $.System }}<|im_start|>system
-{{ $.System }}<|im_end|>{{ "\n" }}
-{{- end }}<|im_start|>{{ .Role }}
-{{ .Content }}<|im_end|>{{ "\n" }}
-{{- end }}<|im_start|>assistant
+{{- range $index, $_ := .Messages }}<|im_start|>{{ .Role }}
+{{ .Content }}<|im_end|>
+{{ end }}<|im_start|>assistant
 `},
 			},
 			Values{
@@ -171,12 +285,12 @@ What is your name?[/INST] `,
 					{Role: "user", Content: "What is your name?"},
 				},
 			},
-			`<|im_start|>user
+			`<|im_start|>system
+You are a helpful assistant!<|im_end|>
+<|im_start|>user
 Hello friend!<|im_end|>
 <|im_start|>assistant
 Hello human!<|im_end|>
-<|im_start|>system
-You are a helpful assistant!<|im_end|>
 <|im_start|>user
 What is your name?<|im_end|>
 <|im_start|>assistant
@@ -193,9 +307,11 @@ What is your name?<|im_end|>
 `},
 				{"messages", `
 {{- range .Messages }}
-{{- if eq .Role "user" }}Question: {{ .Content }}{{ "\n\n" }}
-{{- else if eq .Role "assistant" }}Answer: {{ .Content }}{{ "\n\n" }}
-{{- end }}
+{{- if eq .Role "user" }}Question: {{ .Content }}
+
+{{ else if eq .Role "assistant" }}Answer: {{ .Content }}
+
+{{ end }}
 {{- end }}Answer: `},
 			},
 			Values{
@@ -235,8 +351,8 @@ Answer: `,
 						t.Fatal(err)
 					}
 
-					if b.String() != tt.expected {
-						t.Errorf("expected\n%s,\ngot\n%s", tt.expected, b.String())
+					if diff := cmp.Diff(b.String(), tt.expected); diff != "" {
+						t.Errorf("mismatch (-got +want):\n%s", diff)
 					}
 				})
 			}
