@@ -3,7 +3,7 @@
 package gpu
 
 import (
-	"fmt"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -54,7 +54,7 @@ func commonAMDValidateLibDir() (string, error) {
 	// Installer payload location if we're running the installed binary
 	exe, err := os.Executable()
 	if err == nil {
-		rocmTargetDir := filepath.Join(filepath.Dir(exe), "rocm")
+		rocmTargetDir := filepath.Join(filepath.Dir(exe), "..", "lib", "ollama")
 		if rocmLibUsable(rocmTargetDir) {
 			slog.Debug("detected ROCM next to ollama executable " + rocmTargetDir)
 			return rocmTargetDir, nil
@@ -95,5 +95,5 @@ func commonAMDValidateLibDir() (string, error) {
 		}
 	}
 
-	return "", fmt.Errorf("no suitable rocm found, falling back to CPU")
+	return "", errors.New("no suitable rocm found, falling back to CPU")
 }

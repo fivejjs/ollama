@@ -41,8 +41,10 @@
 
 #if defined(_WIN32)
 #include <windows.h>
+#include <errhandlingapi.h>
 #endif
 
+#include <algorithm>
 #include <cstddef>
 #include <thread>
 #include <chrono>
@@ -401,7 +403,9 @@ struct llama_server_context
             }
         }
 
-        std::tie(model, ctx) = llama_init_from_gpt_params(params);
+        auto init_result = llama_init_from_gpt_params(params);
+        model = init_result.model;
+        ctx = init_result.context;
         if (model == nullptr)
         {
             LOG_ERROR("unable to load model", {{"model", params.model}});
@@ -2418,7 +2422,10 @@ static void server_params_parse(int argc, char **argv, server_params &sparams, g
                 invalid_param = true;
                 break;
             }
-            params.lora_adapter.emplace_back(argv[i], 1.0f);
+            params.lora_adapters.push_back({
+                std::string(argv[i]),
+                1.0,
+            });
             params.use_mmap = false;
         }
         else if (arg == "--lora-scaled")
@@ -2434,17 +2441,11 @@ static void server_params_parse(int argc, char **argv, server_params &sparams, g
                 invalid_param = true;
                 break;
             }
-            params.lora_adapter.emplace_back(lora_adapter, std::stof(argv[i]));
+            params.lora_adapters.push_back({
+                lora_adapter,
+                std::stof(argv[i])
+            });
             params.use_mmap = false;
-        }
-        else if (arg == "--lora-base")
-        {
-            if (++i >= argc)
-            {
-                invalid_param = true;
-                break;
-            }
-            params.lora_base = argv[i];
         }
         else if (arg == "-v" || arg == "--verbose")
         {
@@ -2737,6 +2738,9 @@ int wmain(int argc, wchar_t **wargv) {
     for (int i = 0; i < argc; ++i) {
         argv[i] = wchar_to_char(wargv[i]);
     }
+
+    // Adjust error mode to avoid error dialog after we start.
+    SetErrorMode(SEM_FAILCRITICALERRORS);
 #else
 int main(int argc, char **argv) {
 #endif
@@ -3188,33 +3192,17 @@ int main(int argc, char **argv) {
                     prompt = "";
                 }
 
-                if (prompt.size() == 1) {
-                    prompt = prompt[0];
-                }
-
                 // create and queue the task
-                json responses;
-                {
-                    const int id_task = llama.queue_tasks.get_new_id();
-                    llama.queue_results.add_waiting_task_id(id_task);
-                    llama.request_completion(id_task, {{"prompt", prompt}}, true, -1);
+                const int task_id = llama.queue_tasks.get_new_id();
+                llama.queue_results.add_waiting_task_id(task_id);
+                llama.request_completion(task_id, {{"prompt", prompt}}, true, -1);
 
-                    // get the result
-                    task_result result = llama.queue_results.recv(id_task);
-                    llama.queue_results.remove_waiting_task_id(id_task);
-                    if (result.error) {
-                        return res.set_content(result.result_json.dump(), "application/json; charset=utf-8");
-                    }
+                // get the result
+                task_result result = llama.queue_results.recv(task_id);
+                llama.queue_results.remove_waiting_task_id(task_id);
 
-                    responses = result.result_json.value("results", std::vector<json>{result.result_json});
-                    json embeddings = json::array();
-                    for (auto & elem : responses) {
-                        embeddings.push_back(elem.at("embedding"));
-                    }
-                    // send the result
-                    json embedding_res = json{{"embedding", embeddings}};
-                    return res.set_content(embedding_res.dump(), "application/json; charset=utf-8");
-                }
+                // send the result
+                return res.set_content(result.result_json.dump(), "application/json; charset=utf-8");
             });
 
     // GG: if I put the main loop inside a thread, it crashes on the first request when build in Debug!?

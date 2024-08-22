@@ -112,11 +112,14 @@ func (kv KV) ChatTemplate() string {
 	return s
 }
 
-type Tensors []*Tensor
+type Tensors struct {
+	Items  []*Tensor
+	Offset uint64
+}
 
 func (ts Tensors) Layers() map[string]Layer {
 	layers := make(map[string]Layer)
-	for _, t := range ts {
+	for _, t := range ts.Items {
 		parts := strings.Split(t.Name, ".")
 		if parts[0] == "blk" {
 			// join first and second part, e.g. blk.%d
@@ -152,6 +155,14 @@ type Tensor struct {
 	Shape []uint64 `json:"shape"`
 
 	io.WriterTo `json:"-"`
+}
+
+func (t Tensor) block() (n int) {
+	if _, err := fmt.Sscanf(t.Name, "blk.%d.", &n); err != nil {
+		return -1
+	}
+
+	return
 }
 
 func (t Tensor) blockSize() uint64 {
