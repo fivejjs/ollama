@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -18,7 +19,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ollama/ollama/api"
-	"github.com/ollama/ollama/envconfig"
 	"github.com/ollama/ollama/llm"
 	"github.com/ollama/ollama/openai"
 	"github.com/ollama/ollama/parser"
@@ -275,7 +275,6 @@ func Test_Routes(t *testing.T) {
 	}
 
 	t.Setenv("OLLAMA_MODELS", t.TempDir())
-	envconfig.LoadConfig()
 
 	s := &Server{}
 	router := s.GenerateRoutes()
@@ -306,7 +305,6 @@ func Test_Routes(t *testing.T) {
 
 func TestCase(t *testing.T) {
 	t.Setenv("OLLAMA_MODELS", t.TempDir())
-	envconfig.LoadConfig()
 
 	cases := []string{
 		"mistral",
@@ -386,7 +384,6 @@ func TestCase(t *testing.T) {
 
 func TestShow(t *testing.T) {
 	t.Setenv("OLLAMA_MODELS", t.TempDir())
-	envconfig.LoadConfig()
 
 	var s Server
 
@@ -418,5 +415,40 @@ func TestShow(t *testing.T) {
 
 	if resp.ProjectorInfo["general.architecture"] != "clip" {
 		t.Fatal("Expected projector architecture to be 'clip', but got", resp.ProjectorInfo["general.architecture"])
+	}
+}
+
+func TestNormalize(t *testing.T) {
+	type testCase struct {
+		input []float32
+	}
+
+	testCases := []testCase{
+		{input: []float32{1}},
+		{input: []float32{0, 1, 2, 3}},
+		{input: []float32{0.1, 0.2, 0.3}},
+		{input: []float32{-0.1, 0.2, 0.3, -0.4}},
+		{input: []float32{0, 0, 0}},
+	}
+
+	isNormalized := func(vec []float32) (res bool) {
+		sum := 0.0
+		for _, v := range vec {
+			sum += float64(v * v)
+		}
+		if math.Abs(sum-1) > 1e-6 {
+			return sum == 0
+		} else {
+			return true
+		}
+	}
+
+	for _, tc := range testCases {
+		t.Run("", func(t *testing.T) {
+			normalized := normalize(tc.input)
+			if !isNormalized(normalized) {
+				t.Errorf("Vector %v is not normalized", tc.input)
+			}
+		})
 	}
 }
