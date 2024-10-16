@@ -19,14 +19,18 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/sync/semaphore"
 
 	"github.com/ollama/ollama/api"
+	"github.com/ollama/ollama/build"
 	"github.com/ollama/ollama/envconfig"
 	"github.com/ollama/ollama/format"
 	"github.com/ollama/ollama/gpu"
+	"github.com/ollama/ollama/llama"
+	"github.com/ollama/ollama/runners"
 )
 
 type LlamaServer interface {
@@ -50,6 +54,9 @@ type llmServer struct {
 	status      *StatusWriter
 	options     api.Options
 	numParallel int
+	modelPath   string
+	modelLock   sync.Mutex   // Temporary until we switch fully to Go server
+	model       *llama.Model // If non-nil, the runner is a new Go server
 
 	estimate    MemoryEstimate
 	totalLayers uint64
@@ -91,22 +98,18 @@ func NewLlamaServer(gpus gpu.GpuInfoList, model string, ggml *GGML, adapters, pr
 	var systemFreeMemory uint64
 	var systemSwapFreeMemory uint64
 
-	systemMemInfo, err := gpu.GetCPUMem()
-	if err != nil {
-		slog.Error("failed to lookup system memory", "error", err)
-	} else {
-		systemTotalMemory = systemMemInfo.TotalMemory
-		systemFreeMemory = systemMemInfo.FreeMemory
-		systemSwapFreeMemory = systemMemInfo.FreeSwap
-		slog.Debug("system memory", "total", format.HumanBytes2(systemTotalMemory), "free", format.HumanBytes2(systemFreeMemory), "free_swap", format.HumanBytes2(systemSwapFreeMemory))
-	}
+	systemInfo := gpu.GetSystemInfo()
+	systemTotalMemory = systemInfo.System.TotalMemory
+	systemFreeMemory = systemInfo.System.FreeMemory
+	systemSwapFreeMemory = systemInfo.System.FreeSwap
+	slog.Info("system memory", "total", format.HumanBytes2(systemTotalMemory), "free", format.HumanBytes2(systemFreeMemory), "free_swap", format.HumanBytes2(systemSwapFreeMemory))
 
 	// If the user wants zero GPU layers, reset the gpu list to be CPU/system ram info
 	if opts.NumGPU == 0 {
 		gpus = gpu.GetCPUInfo()
 	}
 	if len(gpus) == 1 && gpus[0].Library == "cpu" {
-		cpuRunner = serverForCpu()
+		cpuRunner = runners.ServerForCpu()
 		estimate = EstimateGPULayers(gpus, ggml, projectors, opts)
 	} else {
 		estimate = EstimateGPULayers(gpus, ggml, projectors, opts)
@@ -118,7 +121,7 @@ func NewLlamaServer(gpus gpu.GpuInfoList, model string, ggml *GGML, adapters, pr
 			opts.NumGPU = 0
 		case gpus[0].Library != "metal" && estimate.Layers == 0:
 			// Don't bother loading into the GPU if no layers can fit
-			cpuRunner = serverForCpu()
+			cpuRunner = runners.ServerForCpu()
 			gpus = gpu.GetCPUInfo()
 		case opts.NumGPU < 0 && estimate.Layers > 0 && gpus[0].Library != "cpu":
 			opts.NumGPU = estimate.Layers
@@ -145,25 +148,20 @@ func NewLlamaServer(gpus gpu.GpuInfoList, model string, ggml *GGML, adapters, pr
 		return nil, errors.New("ollama supports only one lora adapter, but multiple were provided")
 	}
 
-	availableServers := getAvailableServers()
+	rDir, err := runners.Refresh(build.EmbedFS)
+	if err != nil {
+		return nil, err
+	}
+
+	availableServers := runners.GetAvailableServers(rDir)
 	if len(availableServers) == 0 {
-		if runtime.GOOS != "windows" {
-			slog.Warn("llama server binary disappeared, reinitializing payloads")
-			err = Init()
-			if err != nil {
-				slog.Warn("failed to reinitialize payloads", "error", err)
-				return nil, err
-			}
-			availableServers = getAvailableServers()
-		} else {
-			return nil, finalErr
-		}
+		return nil, finalErr
 	}
 	var servers []string
 	if cpuRunner != "" {
 		servers = []string{cpuRunner}
 	} else {
-		servers = serversForGpu(gpus[0]) // All GPUs in the list are matching Library and Variant
+		servers = runners.ServersForGpu(gpus[0]) // All GPUs in the list are matching Library and Variant
 	}
 	demandLib := envconfig.LLMLibrary()
 	if demandLib != "" {
@@ -215,8 +213,11 @@ func NewLlamaServer(gpus gpu.GpuInfoList, model string, ggml *GGML, adapters, pr
 		params = append(params, "--mmproj", projectors[0])
 	}
 
+	defaultThreads := systemInfo.GetOptimalThreadCount()
 	if opts.NumThread > 0 {
 		params = append(params, "--threads", strconv.Itoa(opts.NumThread))
+	} else if defaultThreads > 0 {
+		params = append(params, "--threads", strconv.Itoa(defaultThreads))
 	}
 
 	if !opts.F16KV {
@@ -258,15 +259,7 @@ func NewLlamaServer(gpus gpu.GpuInfoList, model string, ggml *GGML, adapters, pr
 		params = append(params, "--mlock")
 	}
 
-	if gpu.IsNUMA() {
-		numaMode := "distribute"
-		if runtime.GOOS == "linux" {
-			if _, err := exec.LookPath("numactl"); err == nil {
-				numaMode = "numactl"
-			}
-		}
-		params = append(params, "--numa", numaMode)
-	}
+	// TODO - NUMA support currently doesn't work properly
 
 	params = append(params, "--parallel", strconv.Itoa(numParallel))
 
@@ -274,7 +267,11 @@ func NewLlamaServer(gpus gpu.GpuInfoList, model string, ggml *GGML, adapters, pr
 		params = append(params, "--tensor-split", estimate.TensorSplit)
 	}
 
-	for i := range len(servers) {
+	if envconfig.MultiUserCache() {
+		params = append(params, "--multiuser-cache")
+	}
+
+	for i := range servers {
 		dir := availableServers[servers[i]]
 		if dir == "" {
 			// Shouldn't happen
@@ -330,18 +327,20 @@ func NewLlamaServer(gpus gpu.GpuInfoList, model string, ggml *GGML, adapters, pr
 		_, err := os.Stat(server)
 		if errors.Is(err, os.ErrNotExist) {
 			slog.Warn("llama server disappeared, reinitializing payloads", "path", server, "error", err)
-			err = Init()
+			_, err = runners.Refresh(build.EmbedFS)
 			if err != nil {
 				slog.Warn("failed to reinitialize payloads", "error", err)
 				return nil, err
 			}
 		}
 
+		// TODO - once fully switched to the Go runner, load the model here for tokenize/detokenize cgo access
 		s := &llmServer{
 			port:        port,
 			cmd:         exec.Command(server, finalParams...),
 			status:      NewStatusWriter(os.Stderr),
 			options:     opts,
+			modelPath:   model,
 			estimate:    estimate,
 			numParallel: numParallel,
 			sem:         semaphore.NewWeighted(int64(numParallel)),
@@ -409,7 +408,7 @@ func NewLlamaServer(gpus gpu.GpuInfoList, model string, ggml *GGML, adapters, pr
 		}
 
 		if err = s.cmd.Start(); err != nil {
-			// Detect permission denied and augment them essage about noexec
+			// Detect permission denied and augment the message about noexec
 			if errors.Is(err, os.ErrPermission) {
 				finalErr = fmt.Errorf("unable to start server %w.  %s may have noexec set.  Set OLLAMA_TMPDIR for server to a writable executable directory", err, dir)
 				continue
@@ -584,8 +583,7 @@ func (s *llmServer) Ping(ctx context.Context) error {
 
 func (s *llmServer) WaitUntilRunning(ctx context.Context) error {
 	start := time.Now()
-	stallDuration := 5 * time.Minute            // If no progress happens
-	finalLoadDuration := 5 * time.Minute        // After we hit 100%, give the runner more time to come online
+	stallDuration := envconfig.LoadTimeout()    // If no progress happens
 	stallTimer := time.Now().Add(stallDuration) // give up if we stall
 
 	slog.Info("waiting for llama runner to start responding")
@@ -637,7 +635,7 @@ func (s *llmServer) WaitUntilRunning(ctx context.Context) error {
 				stallTimer = time.Now().Add(stallDuration)
 			} else if !fullyLoaded && int(s.loadProgress*100.0) >= 100 {
 				slog.Debug("model load completed, waiting for server to become available", "status", status.ToString())
-				stallTimer = time.Now().Add(finalLoadDuration)
+				stallTimer = time.Now().Add(stallDuration)
 				fullyLoaded = true
 			}
 			time.Sleep(time.Millisecond * 250)
@@ -816,16 +814,16 @@ func (s *llmServer) Completion(ctx context.Context, req CompletionRequest, fn fu
 				continue
 			}
 
+			// slog.Debug("got line", "line", string(line))
 			evt, ok := bytes.CutPrefix(line, []byte("data: "))
 			if !ok {
-				return fmt.Errorf("error parsing llm response stream: %s", line)
+				evt = line
 			}
 
 			var c completion
 			if err := json.Unmarshal(evt, &c); err != nil {
 				return fmt.Errorf("error unmarshalling llm prediction response: %v", err)
 			}
-
 			switch {
 			case strings.TrimSpace(c.Content) == lastToken:
 				tokenRepeat++
@@ -927,7 +925,7 @@ func (s *llmServer) Embedding(ctx context.Context, input string) ([]float32, err
 	}
 
 	if resp.StatusCode >= 400 {
-		log.Printf("llm encode error: %s", body)
+		log.Printf("llm embedding error: %s", body)
 		return nil, fmt.Errorf("%s", body)
 	}
 
@@ -948,6 +946,12 @@ type TokenizeResponse struct {
 }
 
 func (s *llmServer) Tokenize(ctx context.Context, content string) ([]int, error) {
+	s.modelLock.Lock()
+	defer s.modelLock.Unlock()
+	if s.model != nil {
+		return s.model.Tokenize(content, false, true)
+	}
+
 	// Make sure the server is ready
 	status, err := s.getServerStatus(ctx)
 	if err != nil {
@@ -972,6 +976,14 @@ func (s *llmServer) Tokenize(ctx context.Context, content string) ([]int, error)
 		return nil, fmt.Errorf("do encode request: %w", err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		if s.model == nil {
+			slog.Debug("new runner detected, loading model for cgo tokenization")
+			m := llama.LoadModelFromFile(s.modelPath, llama.ModelParams{VocabOnly: true})
+			s.model = m
+		}
+		return s.model.Tokenize(content, false, true)
+	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -1000,6 +1012,15 @@ type DetokenizeResponse struct {
 }
 
 func (s *llmServer) Detokenize(ctx context.Context, tokens []int) (string, error) {
+	s.modelLock.Lock()
+	defer s.modelLock.Unlock()
+	if s.model != nil {
+		var resp string
+		for _, token := range tokens {
+			resp += s.model.TokenToPiece(token)
+		}
+		return resp, nil
+	}
 	// Make sure the server is ready
 	status, err := s.getServerStatus(ctx)
 	if err != nil {
@@ -1024,6 +1045,18 @@ func (s *llmServer) Detokenize(ctx context.Context, tokens []int) (string, error
 		return "", fmt.Errorf("do decode request: %w", err)
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		if s.model == nil {
+			slog.Debug("new runner detected, loading model for cgo tokenization")
+			m := llama.LoadModelFromFile(s.modelPath, llama.ModelParams{VocabOnly: true})
+			s.model = m
+		}
+		var resp string
+		for _, token := range tokens {
+			resp += s.model.TokenToPiece(token)
+		}
+		return resp, nil
+	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -1044,6 +1077,13 @@ func (s *llmServer) Detokenize(ctx context.Context, tokens []int) (string, error
 }
 
 func (s *llmServer) Close() error {
+	s.modelLock.Lock()
+	if s.model != nil {
+		llama.FreeModel(s.model)
+		s.model = nil
+	}
+	s.modelLock.Unlock()
+
 	if s.cmd != nil {
 		slog.Debug("stopping llama server")
 		if err := s.cmd.Process.Kill(); err != nil {
